@@ -1,6 +1,8 @@
 {
-  "chat_ids": [
-    725600839
-  ],
-  "user_settings": {}
+  "settings": {
+    "oi_threshold_percent": 3.0,
+    "time_window_minutes": 10,
+    "monitored_symbols": [],
+    "enabled": true
+  }
 }

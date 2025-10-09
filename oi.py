@@ -6,93 +6,81 @@ import time
 import json
 import os
 from datetime import datetime, timedelta
-from typing import Dict, List, Set
+from typing import Dict, List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.error import TimedOut, NetworkError
 
 class BybitOITracker:
-    def __init__(self, api_key: str, api_secret: str, telegram_token: str):
+    def __init__(self, api_key: str, api_secret: str, telegram_token: str, admin_chat_id: int):
         self.api_key = api_key
         self.api_secret = api_secret
         self.telegram_token = telegram_token
-        self.base_url = "https://api.bybit.com"
+        self.admin_chat_id = admin_chat_id  # Только один пользователь
+        self.base_url = "https://api.bybit.com"  # Убраны пробелы
         
         # Файл для сохранения данных
         self.data_file = "bot_data.json"
         
         # Настройки пользователя (по умолчанию)
-        self.user_settings = {}
+        self.settings = {
+            "oi_threshold_percent": 3.0,
+            "time_window_minutes": 15,
+            "monitored_symbols": set(),
+            "enabled": True
+        }
         
         # Хранилище данных
         self.oi_history: Dict[str, List[Dict]] = {}
         self.price_history: Dict[str, List[Dict]] = {}
-        self.daily_alerts: Dict[str, List[Dict]] = {}
+        self.daily_alerts: Dict[str, List[Dict]] = {}  # Алерты по символам
+        self.last_alert_messages: Dict[str, int] = {}  # {symbol: message_id}
         self.last_reset = datetime.now().date()
+        self.last_alert_time: Dict[str, float] = {}  # {symbol: timestamp} для cooldown
         
         # Telegram
         self.bot_app = None
-        self.chat_ids: Set[int] = set()
         
         # Загрузка сохраненных данных
         self.load_data()
     
     def save_data(self):
-        """Сохранение настроек пользователей и chat_ids"""
+        """Сохранение настроек пользователя"""
         data = {
-            "chat_ids": list(self.chat_ids),
-            "user_settings": {
-                str(chat_id): {
-                    "oi_threshold_percent": settings["oi_threshold_percent"],
-                    "time_window_minutes": settings["time_window_minutes"],
-                    "monitored_symbols": list(settings["monitored_symbols"]),
-                    "enabled": settings["enabled"]
-                }
-                for chat_id, settings in self.user_settings.items()
+            "settings": {
+                "oi_threshold_percent": self.settings["oi_threshold_percent"],
+                "time_window_minutes": self.settings["time_window_minutes"],
+                "monitored_symbols": list(self.settings["monitored_symbols"]),
+                "enabled": self.settings["enabled"]
             }
         }
         
         try:
             with open(self.data_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            print(f"[SAVE] Данные сохранены: {len(self.chat_ids)} пользователей")
+            print(f"[SAVE] Настройки сохранены: порог={self.settings['oi_threshold_percent']}%, окно={self.settings['time_window_minutes']}мин")
         except Exception as e:
             print(f"[ERROR] Ошибка сохранения данных: {e}")
     
     def load_data(self):
-        """Загрузка настроек пользователей и chat_ids"""
+        """Загрузка настроек пользователя"""
         if not os.path.exists(self.data_file):
-            print("[LOAD] Файл данных не найден, используются настройки по умолчанию")
+            print("[INFO] Файл настроек не найден, используются значения по умолчанию")
             return
         
         try:
             with open(self.data_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
-            self.chat_ids = set(data.get("chat_ids", []))
+            saved_settings = data.get("settings", {})
+            self.settings["oi_threshold_percent"] = saved_settings.get("oi_threshold_percent", 3.0)
+            self.settings["time_window_minutes"] = saved_settings.get("time_window_minutes", 15)
+            self.settings["monitored_symbols"] = set(saved_settings.get("monitored_symbols", []))
+            self.settings["enabled"] = saved_settings.get("enabled", True)
             
-            for chat_id_str, settings in data.get("user_settings", {}).items():
-                chat_id = int(chat_id_str)
-                self.user_settings[chat_id] = {
-                    "oi_threshold_percent": settings["oi_threshold_percent"],
-                    "time_window_minutes": settings["time_window_minutes"],
-                    "monitored_symbols": set(settings["monitored_symbols"]),
-                    "enabled": settings["enabled"]
-                }
-            
-            print(f"[LOAD] ✅ Загружено {len(self.chat_ids)} пользователей")
+            print(f"[LOAD] Настройки загружены: порог={self.settings['oi_threshold_percent']}%, окно={self.settings['time_window_minutes']}мин")
         except Exception as e:
             print(f"[ERROR] Ошибка загрузки данных: {e}")
-        
-    def get_user_settings(self, chat_id: int) -> Dict:
-        """Получение настроек пользователя"""
-        if chat_id not in self.user_settings:
-            self.user_settings[chat_id] = {
-                "oi_threshold_percent": 3.0,
-                "time_window_minutes": 15,
-                "monitored_symbols": set(),
-                "enabled": True
-            }
-        return self.user_settings[chat_id]
     
     def _generate_signature(self, params: dict) -> str:
         """Генерация подписи для Bybit API"""
@@ -111,9 +99,8 @@ class BybitOITracker:
     
     def get_coinglass_url(self, symbol: str) -> str:
         """Получение ссылки на Coinglass"""
-        # Убираем USDT из символа для Coinglass
         coin = symbol.replace("USDT", "").replace("PERP", "")
-        return f"https://www.coinglass.com/tv/Bybit_{coin}USDT"
+        return f"https://www.coinglass.com/tv/Bybit_{coin}USDT"  # Убраны пробелы
     
     async def get_all_symbols(self, session: aiohttp.ClientSession) -> List[str]:
         """Получение всех USDT перпетуальных контрактов"""
@@ -122,22 +109,31 @@ class BybitOITracker:
             "category": "linear"
         }
         
-        try:
-            async with session.get(url, params=params) as response:
-                data = await response.json()
-                if data.get("retCode") == 0:
-                    symbols = [
-                        item["symbol"] 
-                        for item in data["result"]["list"]
-                        if item["quoteCoin"] == "USDT" and item["status"] == "Trading"
-                    ]
-                    return symbols
-                else:
-                    print(f"Ошибка получения символов: {data.get('retMsg')}")
-                    return []
-        except Exception as e:
-            print(f"Ошибка при запросе символов: {e}")
-            return []
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    data = await response.json()
+                    if data.get("retCode") == 0:
+                        symbols = [
+                            item["symbol"] 
+                            for item in data["result"]["list"]
+                            if item["quoteCoin"] == "USDT" and item["status"] == "Trading"
+                        ]
+                        return symbols
+                    else:
+                        print(f"[ERROR] Ошибка получения символов: {data.get('retMsg')}")
+                        return []
+            except asyncio.TimeoutError:
+                print(f"[WARN] Timeout при получении символов (попытка {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+            except Exception as e:
+                print(f"[ERROR] Ошибка при запросе символов: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+        
+        return []
     
     async def get_open_interest(self, session: aiohttp.ClientSession, symbol: str) -> Dict:
         """Получение текущего Open Interest для символа"""
@@ -149,7 +145,7 @@ class BybitOITracker:
         }
         
         try:
-            async with session.get(url, params=params) as response:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as response:
                 data = await response.json()
                 if data.get("retCode") == 0 and data["result"]["list"]:
                     latest = data["result"]["list"][0]
@@ -160,8 +156,9 @@ class BybitOITracker:
                         "datetime": datetime.fromtimestamp(int(latest["timestamp"]) / 1000)
                     }
                 return None
+        except asyncio.TimeoutError:
+            return None
         except Exception as e:
-            print(f"Ошибка получения OI для {symbol}: {e}")
             return None
     
     async def get_price_data(self, session: aiohttp.ClientSession, symbol: str) -> Dict:
@@ -173,7 +170,7 @@ class BybitOITracker:
         }
         
         try:
-            async with session.get(url, params=params) as response:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as response:
                 data = await response.json()
                 if data.get("retCode") == 0 and data["result"]["list"]:
                     ticker = data["result"]["list"][0]
@@ -184,15 +181,18 @@ class BybitOITracker:
                         "datetime": datetime.now()
                     }
                 return None
+        except asyncio.TimeoutError:
+            return None
         except Exception as e:
-            print(f"Ошибка получения цены для {symbol}: {e}")
             return None
     
-    def calculate_oi_change(self, symbol: str, current_oi: float, current_time: datetime, time_window: int) -> Dict:
-        """Расчет изменения OI за заданный период"""
+    def calculate_oi_change(self, symbol: str, current_oi: float, current_time: datetime) -> Dict:
+        """Расчет изменения OI за заданный период (используем настройки пользователя)"""
         if symbol not in self.oi_history:
             return None
         
+        # Используем персональные настройки времени
+        time_window = self.settings["time_window_minutes"]
         cutoff_time = current_time - timedelta(minutes=time_window)
         
         # Фильтруем историю по временному окну
@@ -201,7 +201,7 @@ class BybitOITracker:
             if entry["datetime"] >= cutoff_time
         ]
         
-        if not historical_data:
+        if len(historical_data) < 2:
             return None
         
         # Берем самое раннее значение в окне
@@ -221,11 +221,13 @@ class BybitOITracker:
             "timestamp": current_time
         }
     
-    def calculate_price_change(self, symbol: str, current_price: float, current_time: datetime, time_window: int) -> Dict:
-        """Расчет изменения цены за заданный период"""
+    def calculate_price_change(self, symbol: str, current_price: float, current_time: datetime) -> Dict:
+        """Расчет изменения цены за заданный период (используем настройки пользователя)"""
         if symbol not in self.price_history:
             return None
         
+        # Используем персональные настройки времени
+        time_window = self.settings["time_window_minutes"]
         cutoff_time = current_time - timedelta(minutes=time_window)
         
         # Фильтруем историю по временному окну
@@ -234,7 +236,7 @@ class BybitOITracker:
             if entry["datetime"] >= cutoff_time
         ]
         
-        if not historical_data:
+        if len(historical_data) < 2:
             return None
         
         # Берем самое раннее значение в окне
@@ -251,31 +253,38 @@ class BybitOITracker:
             "new_price": current_price
         }
     
-    def should_alert(self, change_percent: float, threshold: float) -> bool:
+    def should_alert(self, symbol: str, change_percent: float) -> bool:
         """Проверка, нужно ли отправлять уведомление"""
-        return abs(change_percent) >= threshold
-    
-    def get_alert_number(self, symbol: str) -> int:
-        """Получение номера уведомления для символа за день"""
-        today = datetime.now().date()
+        # Проверка порога
+        if abs(change_percent) < self.settings["oi_threshold_percent"]:
+            return False
         
+        # Проверка лимита 5 алертов в день
+        today = datetime.now().date()
         if today != self.last_reset:
             self.daily_alerts.clear()
+            self.last_alert_messages.clear()
+            self.last_alert_time.clear()
             self.last_reset = today
         
         if symbol not in self.daily_alerts:
             self.daily_alerts[symbol] = []
         
-        # Ограничение до 5 уведомлений в день
         if len(self.daily_alerts[symbol]) >= 5:
-            return -1  # Не отправляем больше уведомлений
+            return False
         
-        # Проверяем, не было ли уведомления в последние 2 минуты (защита от дублей)
-        if self.daily_alerts[symbol]:
-            last_alert_time = self.daily_alerts[symbol][-1]["timestamp"]
-            if (datetime.now() - last_alert_time).total_seconds() < 120:
-                return -1  # Слишком рано для нового уведомления
+        # Cooldown 3 минуты между алертами на одну монету
+        if symbol in self.last_alert_time:
+            time_since_last = time.time() - self.last_alert_time[symbol]
+            if time_since_last < 180:  # 3 минуты
+                return False
         
+        return True
+    
+    def get_alert_number(self, symbol: str) -> int:
+        """Получение номера уведомления для символа за день"""
+        if symbol not in self.daily_alerts:
+            return 1
         return len(self.daily_alerts[symbol]) + 1
     
     def register_alert(self, symbol: str, alert_data: Dict):
@@ -287,6 +296,7 @@ class BybitOITracker:
             "timestamp": datetime.now(),
             "data": alert_data
         })
+        self.last_alert_time[symbol] = time.time()
     
     def format_alert(self, change_data: Dict, alert_number: int, price_data: Dict = None) -> str:
         """Форматирование уведомления для Telegram"""
@@ -294,8 +304,6 @@ class BybitOITracker:
         emoji = "🟢" if change_data["change_percent"] > 0 else "🔴"
         
         coinglass_url = self.get_coinglass_url(change_data['symbol'])
-        
-        # Используем текущее время для уведомления
         current_time = datetime.now()
         
         # Базовая информация
@@ -328,127 +336,176 @@ class BybitOITracker:
 """
         return alert
     
-    async def send_alert_to_users(self, alert_message: str):
-        """Отправка уведомления всем активным пользователям"""
-        for chat_id in self.chat_ids:
-            settings = self.get_user_settings(chat_id)
-            if settings["enabled"]:
-                try:
-                    await self.bot_app.bot.send_message(
-                        chat_id=chat_id,
-                        text=alert_message,
-                        parse_mode='HTML',
-                        disable_web_page_preview=True
-                    )
-                except Exception as e:
-                    print(f"Ошибка отправки сообщения пользователю {chat_id}: {e}")
+    async def send_alert(self, alert_message: str, symbol: str):
+        """Отправка уведомления с retry логикой"""
+        if not self.settings["enabled"]:
+            return
+        
+        max_retries = 5
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                # Получаем ID предыдущего сообщения для этой монеты
+                reply_to_message_id = self.last_alert_messages.get(symbol)
+                
+                # Отправляем сообщение
+                sent_message = await self.bot_app.bot.send_message(
+                    chat_id=self.admin_chat_id,
+                    text=alert_message,
+                    parse_mode='HTML',
+                    disable_web_page_preview=True,
+                    reply_to_message_id=reply_to_message_id
+                )
+                
+                # Сохраняем ID отправленного сообщения
+                self.last_alert_messages[symbol] = sent_message.message_id
+                
+                print(f"[SEND] ✅ Алерт отправлен: {symbol}")
+                return  # Успешно отправили
+                
+            except TimedOut:
+                print(f"[WARN] ⏱ Timeout при отправке алерта {symbol} (попытка {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    print(f"[ERROR] ❌ Не удалось отправить алерт {symbol} после {max_retries} попыток")
+                    
+            except NetworkError as e:
+                print(f"[WARN] 🌐 Network error при отправке {symbol} (попытка {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    print(f"[ERROR] ❌ Network error, не удалось отправить алерт {symbol}")
+                    
+            except Exception as e:
+                print(f"[ERROR] ❌ Ошибка отправки алерта {symbol}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                else:
+                    break
     
     async def update_oi_data(self, session: aiohttp.ClientSession, symbols: List[str]):
         """Обновление данных OI для всех символов"""
-        # Получаем OI и цены параллельно
-        oi_tasks = [self.get_open_interest(session, symbol) for symbol in symbols]
-        price_tasks = [self.get_price_data(session, symbol) for symbol in symbols]
+        # Ограничиваем количество одновременных запросов
+        semaphore = asyncio.Semaphore(50)
         
-        oi_results = await asyncio.gather(*oi_tasks)
-        price_results = await asyncio.gather(*price_tasks)
+        async def fetch_with_semaphore(coro):
+            async with semaphore:
+                return await coro
+        
+        # Получаем OI и цены параллельно с ограничением
+        oi_tasks = [fetch_with_semaphore(self.get_open_interest(session, symbol)) for symbol in symbols]
+        price_tasks = [fetch_with_semaphore(self.get_price_data(session, symbol)) for symbol in symbols]
+        
+        oi_results = await asyncio.gather(*oi_tasks, return_exceptions=True)
+        price_results = await asyncio.gather(*price_tasks, return_exceptions=True)
         
         successful_updates = 0
         alerts_triggered = 0
         
-        # Для отладки - показываем топ монеты
-        debug_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
-        
         # Обрабатываем результаты
-        for oi_result, price_result in zip(oi_results, price_results):
-            if oi_result and price_result:
-                successful_updates += 1
-                symbol = oi_result["symbol"]
+        for i, (oi_result, price_result) in enumerate(zip(oi_results, price_results)):
+            symbol = symbols[i]
+            
+            # Пропускаем если исключение или None
+            if isinstance(oi_result, Exception) or isinstance(price_result, Exception):
+                continue
+            
+            if not oi_result or not price_result:
+                continue
+            
+            successful_updates += 1
+            
+            # Инициализация истории для символа
+            if symbol not in self.oi_history:
+                self.oi_history[symbol] = []
+            if symbol not in self.price_history:
+                self.price_history[symbol] = []
+            
+            # Добавление новых данных
+            self.oi_history[symbol].append(oi_result)
+            self.price_history[symbol].append(price_result)
+            
+            # Очистка старых данных (храним данные за последние 2 часа)
+            cutoff_time = oi_result["datetime"] - timedelta(hours=2)
+            self.oi_history[symbol] = [
+                entry for entry in self.oi_history[symbol]
+                if entry["datetime"] >= cutoff_time
+            ]
+            self.price_history[symbol] = [
+                entry for entry in self.price_history[symbol]
+                if entry["datetime"] >= cutoff_time
+            ]
+            
+            # Проверка изменений (только если есть данные и если отслеживается монета)
+            if self.settings["monitored_symbols"] and symbol not in self.settings["monitored_symbols"]:
+                continue
+            
+            if len(self.oi_history[symbol]) < 2 or len(self.price_history[symbol]) < 2:
+                continue
+            
+            oi_change_data = self.calculate_oi_change(
+                symbol,
+                oi_result["openInterest"],
+                oi_result["datetime"]
+            )
+            
+            price_change_data = self.calculate_price_change(
+                symbol,
+                price_result["price"],
+                price_result["datetime"]
+            )
+            
+            if oi_change_data and self.should_alert(symbol, oi_change_data["change_percent"]):
+                alert_number = self.get_alert_number(symbol)
+                print(f"[ALERT] 🔔 Триггер алерта для {symbol}: {oi_change_data['change_percent']:+.2f}% (порог: {self.settings['oi_threshold_percent']}%)")
                 
-                # Инициализация истории для символа
-                if symbol not in self.oi_history:
-                    self.oi_history[symbol] = []
-                if symbol not in self.price_history:
-                    self.price_history[symbol] = []
-                
-                # Добавление новых данных OI
-                self.oi_history[symbol].append(oi_result)
-                
-                # Добавление новых данных цены
-                self.price_history[symbol].append(price_result)
-                
-                # Очистка старых данных (храним данные за последний час)
-                cutoff_time = oi_result["datetime"] - timedelta(hours=1)
-                self.oi_history[symbol] = [
-                    entry for entry in self.oi_history[symbol]
-                    if entry["datetime"] >= cutoff_time
-                ]
-                self.price_history[symbol] = [
-                    entry for entry in self.price_history[symbol]
-                    if entry["datetime"] >= cutoff_time
-                ]
-                
-                # Проверка изменений для каждого пользователя
-                if len(self.oi_history[symbol]) > 1 and len(self.price_history[symbol]) > 1:
-                    alert_sent = False  # Флаг для отправки только одного уведомления
-                    
-                    for chat_id in self.chat_ids:
-                        if alert_sent:  # Если уже отправили уведомление, пропускаем остальных
-                            break
-                            
-                        settings = self.get_user_settings(chat_id)
-                        
-                        if not settings["enabled"]:
-                            continue
-                        
-                        # Если пользователь отслеживает конкретные монеты
-                        if settings["monitored_symbols"] and symbol not in settings["monitored_symbols"]:
-                            continue
-                        
-                        oi_change_data = self.calculate_oi_change(
-                            symbol,
-                            oi_result["openInterest"],
-                            oi_result["datetime"],
-                            settings["time_window_minutes"]
-                        )
-                        
-                        price_change_data = self.calculate_price_change(
-                            symbol,
-                            price_result["price"],
-                            price_result["datetime"],
-                            settings["time_window_minutes"]
-                        )
-                        
-                        # DEBUG: показываем изменения для топ монет
-                        if symbol in debug_symbols and oi_change_data:
-                            print(f"[DEBUG] {symbol}: OI {oi_change_data['change_percent']:+.2f}% | "
-                                  f"Цена {price_change_data['price_change_percent']:+.2f}% | "
-                                  f"Порог: {settings['oi_threshold_percent']}% | "
-                                  f"История: {len(self.oi_history[symbol])} точек")
-                        
-                        if oi_change_data and self.should_alert(oi_change_data["change_percent"], settings["oi_threshold_percent"]):
-                            alert_number = self.get_alert_number(symbol)
-                            
-                            if alert_number > 0:
-                                print(f"[ALERT] 🔔 Отправка алерта для {symbol}: {oi_change_data['change_percent']:+.2f}%")
-                                alert_message = self.format_alert(oi_change_data, alert_number, price_change_data)
-                                await self.send_alert_to_users(alert_message)
-                                self.register_alert(symbol, oi_change_data)
-                                alerts_triggered += 1
-                                alert_sent = True  # Помечаем что уведомление отправлено
-                            else:
-                                print(f"[SKIP] {symbol}: Достигнут лимит уведомлений или слишком рано")
+                alert_message = self.format_alert(oi_change_data, alert_number, price_change_data)
+                await self.send_alert(alert_message, symbol)
+                self.register_alert(symbol, oi_change_data)
+                alerts_triggered += 1
         
-        active_users = len([cid for cid in self.chat_ids if self.get_user_settings(cid)["enabled"]])
-        print(f"[INFO] {datetime.now().strftime('%H:%M:%S')} - Обновлено: {successful_updates}/{len(symbols)} | "
-              f"Алертов: {alerts_triggered} | Активных пользователей: {active_users}")
+        status = "✅ Активен" if self.settings["enabled"] else "⏸ Пауза"
+        monitored = "Все монеты" if not self.settings["monitored_symbols"] else f"{len(self.settings['monitored_symbols'])} монет"
+        print(f"[INFO] {datetime.now().strftime('%H:%M:%S')} | Обновлено: {successful_updates}/{len(symbols)} | "
+              f"Алертов: {alerts_triggered} | Статус: {status} | Отслеживается: {monitored}")
+    
+    async def safe_reply(self, update_or_query, text: str, **kwargs):
+        """Безопасная отправка ответа с retry логикой"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Проверяем что передано - Update или CallbackQuery
+                if hasattr(update_or_query, 'message'):
+                    # Это Update
+                    await update_or_query.message.reply_text(text, **kwargs)
+                else:
+                    # Это CallbackQuery
+                    await update_or_query.message.reply_text(text, **kwargs)
+                return
+            except (TimedOut, NetworkError):
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                else:
+                    print(f"[ERROR] Не удалось отправить ответ после {max_retries} попыток")
+            except Exception as e:
+                print(f"[ERROR] Ошибка отправки ответа: {e}")
+                break
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
         chat_id = update.effective_chat.id
-        self.chat_ids.add(chat_id)
-        self.save_data()  # Сохраняем после добавления пользователя
         
-        settings = self.get_user_settings(chat_id)
+        # Проверка что это админ
+        if chat_id != self.admin_chat_id:
+            await update.message.reply_text("❌ Доступ запрещен. Бот работает только для владельца.")
+            return
+        
+        self.settings["enabled"] = True
+        self.save_data()
         
         welcome_message = f"""
 👋 <b>Добро пожаловать в Bybit OI Tracker!</b>
@@ -456,10 +513,11 @@ class BybitOITracker:
 Бот отслеживает изменения Open Interest на Bybit и присылает уведомления.
 
 📊 <b>Ваши текущие настройки:</b>
-• Порог изменения: {settings['oi_threshold_percent']}%
-• Временное окно: {settings['time_window_minutes']} минут
-• Максимум алертов в день: 5
-• Отслеживаемые монеты: {'Все' if not settings['monitored_symbols'] else len(settings['monitored_symbols'])}
+• Порог изменения: {self.settings['oi_threshold_percent']}%
+• Временное окно: {self.settings['time_window_minutes']} минут
+• Максимум алертов в день: 5 на монету
+• Cooldown между алертами: 3 минуты
+• Отслеживаемые монеты: {'Все' if not self.settings['monitored_symbols'] else len(self.settings['monitored_symbols'])}
 
 <b>Доступные команды:</b>
 /settings - Изменить настройки
@@ -469,10 +527,14 @@ class BybitOITracker:
 /start - Возобновить уведомления
 """
         
-        await update.message.reply_text(welcome_message, parse_mode='HTML')
+        await self.safe_reply(update, welcome_message, parse_mode='HTML')
     
     async def settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /settings"""
+        chat_id = update.effective_chat.id
+        if chat_id != self.admin_chat_id:
+            return
+        
         keyboard = [
             [InlineKeyboardButton("📊 Изменить порог (%)", callback_data="set_threshold")],
             [InlineKeyboardButton("⏱ Изменить период (мин)", callback_data="set_time")],
@@ -481,7 +543,8 @@ class BybitOITracker:
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await update.message.reply_text(
+        await self.safe_reply(
+            update,
             "⚙️ <b>Настройки бота</b>\n\nВыберите параметр для изменения:",
             reply_markup=reply_markup,
             parse_mode='HTML'
@@ -490,10 +553,11 @@ class BybitOITracker:
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /status"""
         chat_id = update.effective_chat.id
-        settings = self.get_user_settings(chat_id)
+        if chat_id != self.admin_chat_id:
+            return
         
-        status = "✅ Включен" if settings["enabled"] else "❌ Выключен"
-        coins = "Все монеты" if not settings["monitored_symbols"] else f"{len(settings['monitored_symbols'])} монет"
+        status = "✅ Включен" if self.settings["enabled"] else "❌ Выключен"
+        coins = "Все монеты" if not self.settings["monitored_symbols"] else f"{len(self.settings['monitored_symbols'])} монет"
         
         # Статистика алертов за сегодня
         total_alerts_today = sum(len(alerts) for alerts in self.daily_alerts.values())
@@ -502,33 +566,48 @@ class BybitOITracker:
 📊 <b>Текущий статус бота</b>
 
 🔔 Статус: {status}
-📈 Порог изменения: {settings['oi_threshold_percent']}%
-⏱ Временное окно: {settings['time_window_minutes']} минут
+📈 Порог изменения: {self.settings['oi_threshold_percent']}%
+⏱ Временное окно: {self.settings['time_window_minutes']} минут
 🪙 Отслеживается: {coins}
 📢 Уведомлений сегодня: {total_alerts_today}
+
+<b>Монеты с алертами сегодня:</b>
 """
         
-        await update.message.reply_text(status_message, parse_mode='HTML')
+        if self.daily_alerts:
+            for symbol, alerts in sorted(self.daily_alerts.items(), key=lambda x: len(x[1]), reverse=True):
+                status_message += f"• {symbol}: {len(alerts)}/5\n"
+        else:
+            status_message += "Пока нет алертов\n"
+        
+        await self.safe_reply(update, status_message, parse_mode='HTML')
     
     async def stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /stop"""
         chat_id = update.effective_chat.id
-        settings = self.get_user_settings(chat_id)
-        settings["enabled"] = False
-        self.save_data()  # Сохраняем изменения
+        if chat_id != self.admin_chat_id:
+            return
         
-        await update.message.reply_text(
+        self.settings["enabled"] = False
+        self.save_data()
+        
+        await self.safe_reply(
+            update,
             "⏸ Уведомления остановлены.\nДля возобновления используйте /start"
         )
     
     async def test_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /test - отправка тестового алерта"""
+        """Обработчик команды /test"""
+        chat_id = update.effective_chat.id
+        if chat_id != self.admin_chat_id:
+            return
+        
         test_change_data = {
             "symbol": "BTCUSDT",
             "change_percent": 5.23,
             "old_oi": 1234567.00,
             "new_oi": 1299135.00,
-            "time_window": 15,
+            "time_window": self.settings["time_window_minutes"],
             "timestamp": datetime.now()
         }
         
@@ -539,31 +618,59 @@ class BybitOITracker:
         }
         
         test_message = self.format_alert(test_change_data, 1, test_price_data)
-        await update.message.reply_text(
-            "📬 Отправка тестового уведомления...\n\n" + test_message,
-            parse_mode='HTML',
-            disable_web_page_preview=True
-        )
+        
+        # Отправка с retry логикой
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                await update.message.reply_text(
+                    "📬 Отправка тестового уведомления...\n\n" + test_message,
+                    parse_mode='HTML',
+                    disable_web_page_preview=True
+                )
+                return
+            except (TimedOut, NetworkError) as e:
+                if attempt < max_retries - 1:
+                    print(f"[WARN] Timeout при отправке /test (попытка {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(2)
+                else:
+                    print(f"[ERROR] Не удалось отправить /test после {max_retries} попыток")
+                    try:
+                        await update.message.reply_text("❌ Ошибка отправки. Попробуйте еще раз.")
+                    except:
+                        pass
+            except Exception as e:
+                print(f"[ERROR] Ошибка в /test: {e}")
+                break
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик нажатий на кнопки"""
         query = update.callback_query
+        chat_id = query.from_user.id
+        
+        if chat_id != self.admin_chat_id:
+            await query.answer("❌ Доступ запрещен")
+            return
+        
         await query.answer()
         
         if query.data == "close":
             await query.message.delete()
         elif query.data == "set_threshold":
-            await query.message.reply_text(
+            await self.safe_reply(
+                query,
                 "📊 Введите новый порог изменения OI в процентах (например: 5):"
             )
             context.user_data["waiting_for"] = "threshold"
         elif query.data == "set_time":
-            await query.message.reply_text(
+            await self.safe_reply(
+                query,
                 "⏱ Введите новое временное окно в минутах (например: 15):"
             )
             context.user_data["waiting_for"] = "time"
         elif query.data == "set_coins":
-            await query.message.reply_text(
+            await self.safe_reply(
+                query,
                 "🪙 Отправьте список монет через запятую (например: BTCUSDT, ETHUSDT, SOLUSDT)\n"
                 "Или отправьте 'все' для отслеживания всех монет."
             )
@@ -572,53 +679,52 @@ class BybitOITracker:
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик текстовых сообщений"""
         chat_id = update.effective_chat.id
-        settings = self.get_user_settings(chat_id)
-        text = update.message.text.strip()
         
+        if chat_id != self.admin_chat_id:
+            return
+        
+        text = update.message.text.strip()
         waiting_for = context.user_data.get("waiting_for")
         
         if waiting_for == "threshold":
             try:
                 value = float(text)
                 if 0 < value <= 100:
-                    settings["oi_threshold_percent"] = value
-                    self.save_data()  # Сохраняем изменения
-                    await update.message.reply_text(
-                        f"✅ Порог изменения установлен: {value}%"
-                    )
+                    self.settings["oi_threshold_percent"] = value
+                    self.save_data()
+                    await self.safe_reply(update, f"✅ Порог изменения установлен: {value}%")
                 else:
-                    await update.message.reply_text("❌ Значение должно быть от 0 до 100")
+                    await self.safe_reply(update, "❌ Значение должно быть от 0 до 100")
             except ValueError:
-                await update.message.reply_text("❌ Неверный формат. Введите число.")
+                await self.safe_reply(update, "❌ Неверный формат. Введите число.")
             context.user_data.pop("waiting_for", None)
             
         elif waiting_for == "time":
             try:
                 value = int(text)
                 if 1 <= value <= 1440:
-                    settings["time_window_minutes"] = value
-                    self.save_data()  # Сохраняем изменения
-                    await update.message.reply_text(
-                        f"✅ Временное окно установлено: {value} минут"
-                    )
+                    self.settings["time_window_minutes"] = value
+                    self.save_data()
+                    await self.safe_reply(update, f"✅ Временное окно установлено: {value} минут")
                 else:
-                    await update.message.reply_text("❌ Значение должно быть от 1 до 1440 минут")
+                    await self.safe_reply(update, "❌ Значение должно быть от 1 до 1440 минут")
             except ValueError:
-                await update.message.reply_text("❌ Неверный формат. Введите число.")
+                await self.safe_reply(update, "❌ Неверный формат. Введите число.")
             context.user_data.pop("waiting_for", None)
             
         elif waiting_for == "coins":
             if text.lower() == "все":
-                settings["monitored_symbols"] = set()
-                self.save_data()  # Сохраняем изменения
-                await update.message.reply_text("✅ Теперь отслеживаются все монеты")
+                self.settings["monitored_symbols"] = set()
+                self.save_data()
+                await self.safe_reply(update, "✅ Теперь отслеживаются все монеты")
             else:
                 coins = [coin.strip().upper() for coin in text.split(",")]
                 # Добавляем USDT если не указано
                 coins = [coin if coin.endswith("USDT") else f"{coin}USDT" for coin in coins]
-                settings["monitored_symbols"] = set(coins)
-                self.save_data()  # Сохраняем изменения
-                await update.message.reply_text(
+                self.settings["monitored_symbols"] = set(coins)
+                self.save_data()
+                await self.safe_reply(
+                    update,
                     f"✅ Установлено отслеживание {len(coins)} монет:\n{', '.join(coins)}"
                 )
             context.user_data.pop("waiting_for", None)
@@ -631,6 +737,12 @@ class BybitOITracker:
             # Получение списка всех символов
             print("📋 Получение списка торговых пар...")
             symbols = await self.get_all_symbols(session)
+            
+            if not symbols:
+                print("❌ Не удалось получить список символов. Повтор через 60 секунд...")
+                await asyncio.sleep(60)
+                return await self.monitoring_loop()
+            
             print(f"✅ Получено {len(symbols)} торговых пар\n")
             
             # Основной цикл
@@ -645,9 +757,7 @@ class BybitOITracker:
     async def run(self):
         """Запуск бота"""
         print("🤖 Запуск Telegram бота...")
-        
-        if self.chat_ids:
-            print(f"📱 Найдено {len(self.chat_ids)} сохраненных пользователей")
+        print(f"👤 Бот настроен только для пользователя: {self.admin_chat_id}")
         
         # Создание приложения
         self.bot_app = Application.builder().token(self.telegram_token).build()
@@ -668,16 +778,14 @@ class BybitOITracker:
         
         print("✅ Telegram бот запущен!")
         
-        # Уведомляем пользователей о перезапуске
-        if self.chat_ids:
-            for chat_id in self.chat_ids:
-                try:
-                    await self.bot_app.bot.send_message(
-                        chat_id=chat_id,
-                        text="🔄 Бот перезапущен и снова работает!\n\nВаши настройки сохранены ✅"
-                    )
-                except Exception as e:
-                    print(f"[ERROR] Не удалось отправить уведомление пользователю {chat_id}: {e}")
+        # Уведомляем пользователя о перезапуске
+        try:
+            await self.bot_app.bot.send_message(
+                chat_id=self.admin_chat_id,
+                text="🔄 Бот перезапущен и снова работает!\n\nВаши настройки сохранены ✅"
+            )
+        except Exception as e:
+            print(f"[WARN] Не удалось отправить уведомление о запуске: {e}")
         
         print()
         
@@ -691,8 +799,11 @@ async def main():
     BYBIT_API_SECRET = "vvjYDz7JRsf2aBhPIFuBEAob37O1W8NC7eHz"
     TELEGRAM_TOKEN = "8187121513:AAHnKKps-TTzvXcK08MeUFJcCil2C4_IB8I"
     
+    # ВАЖНО: Укажи свой chat_id (узнать можно через @userinfobot)
+    ADMIN_CHAT_ID = 725600839,  # ЗАМЕНИ НА СВОЙ CHAT_ID!
+    
     # Создание и запуск трекера
-    tracker = BybitOITracker(BYBIT_API_KEY, BYBIT_API_SECRET, TELEGRAM_TOKEN)
+    tracker = BybitOITracker(BYBIT_API_KEY, BYBIT_API_SECRET, TELEGRAM_TOKEN, ADMIN_CHAT_ID)
     await tracker.run()
 
 
