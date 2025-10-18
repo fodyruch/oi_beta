@@ -284,10 +284,10 @@ class BybitOITracker:
         if len(self.daily_alerts[symbol]) >= 5:
             return False
         
-        # Cooldown 3 минуты между алертами на одну монету
+        # Cooldown 10 минут между алертами на одну монету
         if symbol in self.last_alert_time:
             time_since_last = time.time() - self.last_alert_time[symbol]
-            if time_since_last < 180:  # 3 минуты
+            if time_since_last < 600:  # 10 минут (было 180 секунд)
                 return False
         
         return True
@@ -299,7 +299,9 @@ class BybitOITracker:
         return len(self.daily_alerts[symbol]) + 1
     
     def register_alert(self, symbol: str, alert_data: Dict):
-        """Регистрация отправленного уведомления"""
+        """Регистрация отправленного уведомления и очистка истории"""
+        print(f"[REGISTER] Регистрация алерта для {symbol}...")
+        
         if symbol not in self.daily_alerts:
             self.daily_alerts[symbol] = []
         
@@ -308,6 +310,29 @@ class BybitOITracker:
             "data": alert_data
         })
         self.last_alert_time[symbol] = time.time()
+        
+        # НОВОЕ: Очистка истории после алерта для избежания дублей
+        alert_time = alert_data["timestamp"]
+        
+        # Удаляем все данные OI старше момента алерта
+        if symbol in self.oi_history:
+            old_count = len(self.oi_history[symbol])
+            self.oi_history[symbol] = [
+                entry for entry in self.oi_history[symbol]
+                if entry["datetime"] >= alert_time
+            ]
+            new_count = len(self.oi_history[symbol])
+            print(f"[CLEANUP] Очищена история OI для {symbol}: {old_count} → {new_count} записей (удалено: {old_count - new_count})")
+        
+        # Удаляем все данные цены старше момента алерта
+        if symbol in self.price_history:
+            old_count = len(self.price_history[symbol])
+            self.price_history[symbol] = [
+                entry for entry in self.price_history[symbol]
+                if entry["datetime"] >= alert_time
+            ]
+            new_count = len(self.price_history[symbol])
+            print(f"[CLEANUP] Очищена история цены для {symbol}: {old_count} → {new_count} записей (удалено: {old_count - new_count})")
     
     def format_alert(self, change_data: Dict, alert_number: int, price_data: Dict = None) -> str:
         """Форматирование уведомления для Telegram"""
@@ -478,7 +503,12 @@ class BybitOITracker:
                 
                 alert_message = self.format_alert(oi_change_data, alert_number, price_change_data)
                 await self.send_alert(alert_message, symbol)
+                
+                # КРИТИЧНО: Регистрируем алерт и очищаем историю СРАЗУ после отправки
+                print(f"[DEBUG] Вызов register_alert для {symbol}")
                 self.register_alert(symbol, oi_change_data)
+                print(f"[DEBUG] register_alert завершен для {symbol}")
+                
                 alerts_triggered += 1
         
         status = "✅ Активен" if self.settings["enabled"] else "⏸ Пауза"
@@ -529,7 +559,7 @@ class BybitOITracker:
 • Порог изменения: {self.settings['oi_threshold_percent']}%
 • Временное окно: {self.settings['time_window_minutes']} минут
 • Максимум алертов в день: 5 на монету
-• Cooldown между алертами: 3 минуты
+• Cooldown между алертами: 10 минут
 • Отслеживаемые монеты: {'Все' if not self.settings['monitored_symbols'] else len(self.settings['monitored_symbols'])}
 
 <b>Доступные команды:</b>
@@ -808,15 +838,37 @@ class BybitOITracker:
 
 
 async def main():
-    # API ключи
-    BYBIT_API_KEY = "AEpTFcr7Fvj2fPZYhf"
-    BYBIT_API_SECRET = "vvjYDz7JRsf2aBhPIFuBEAob37O1W8NC7eHz"
-    TELEGRAM_TOKEN = "8187121513:AAHnKKps-TTzvXcK08MeUFJcCil2C4_IB8I"
+    # Загрузка API ключей из переменных окружения
+    BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+    BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     
-    # ВАЖНО: Укажи свой chat_id (узнать можно через @userinfobot)
-    # Можно передать список chat_ids или один ID
-    ADMIN_CHAT_IDS = [123456789, 987654321]  # ЗАМЕНИ НА СВОИ CHAT_ID'Ы!
-    # Или один ID: ADMIN_CHAT_IDS = 123456789
+    # Загрузка chat_ids (можно через запятую в .env)
+    admin_ids_str = os.getenv("ADMIN_CHAT_IDS")
+    
+    # Проверка что все ключи загружены
+    if not all([BYBIT_API_KEY, BYBIT_API_SECRET, TELEGRAM_TOKEN, admin_ids_str]):
+        print("❌ ОШИБКА: Не все ключи найдены в .env файле!")
+        print("Проверьте что в .env файле есть:")
+        print("- BYBIT_API_KEY")
+        print("- BYBIT_API_SECRET")
+        print("- TELEGRAM_TOKEN")
+        print("- ADMIN_CHAT_IDS")
+        return
+    
+    # Парсинг chat_ids (поддержка одного ID или списка через запятую)
+    try:
+        if ',' in admin_ids_str:
+            ADMIN_CHAT_IDS = [int(x.strip()) for x in admin_ids_str.split(',')]
+        else:
+            ADMIN_CHAT_IDS = [int(admin_ids_str.strip())]
+    except ValueError:
+        print("❌ ОШИБКА: Неверный формат ADMIN_CHAT_IDS в .env файле!")
+        print("Должно быть число или числа через запятую, например: 123456789 или 123456789,987654321")
+        return
+    
+    print(f"✅ Конфигурация загружена из .env")
+    print(f"👥 Авторизованных пользователей: {len(ADMIN_CHAT_IDS)}")
     
     # Создание и запуск трекера
     tracker = BybitOITracker(BYBIT_API_KEY, BYBIT_API_SECRET, TELEGRAM_TOKEN, ADMIN_CHAT_IDS)
