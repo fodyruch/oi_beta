@@ -10,13 +10,18 @@ from typing import Dict, List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.error import TimedOut, NetworkError
+from dotenv import load_dotenv
+
+# Загрузка переменных окружения из .env файла
+load_dotenv()
 
 class BybitOITracker:
-    def __init__(self, api_key: str, api_secret: str, telegram_token: str, admin_chat_id: int):
+    def __init__(self, api_key: str, api_secret: str, telegram_token: str, admin_chat_ids: list):
         self.api_key = api_key
         self.api_secret = api_secret
         self.telegram_token = telegram_token
-        self.admin_chat_id = admin_chat_id  # Только один пользователь
+        # Поддержка нескольких пользователей
+        self.admin_chat_ids = set(admin_chat_ids) if isinstance(admin_chat_ids, list) else {admin_chat_ids}
         self.base_url = "https://api.bybit.com"  # Убраны пробелы
         
         # Файл для сохранения данных
@@ -149,9 +154,15 @@ class BybitOITracker:
                 data = await response.json()
                 if data.get("retCode") == 0 and data["result"]["list"]:
                     latest = data["result"]["list"][0]
+                    oi_value = float(latest["openInterest"])
+                    
+                    # Фильтр: пропускаем монеты с OI меньше 1 миллиона
+                    if oi_value < 1000000:
+                        return None
+                    
                     return {
                         "symbol": symbol,
-                        "openInterest": float(latest["openInterest"]),
+                        "openInterest": oi_value,
                         "timestamp": int(latest["timestamp"]) / 1000,
                         "datetime": datetime.fromtimestamp(int(latest["timestamp"]) / 1000)
                     }
@@ -337,55 +348,57 @@ class BybitOITracker:
         return alert
     
     async def send_alert(self, alert_message: str, symbol: str):
-        """Отправка уведомления с retry логикой"""
+        """Отправка уведомления всем админам с retry логикой"""
         if not self.settings["enabled"]:
             return
         
         max_retries = 5
         retry_delay = 2
         
-        for attempt in range(max_retries):
-            try:
-                # Получаем ID предыдущего сообщения для этой монеты
-                reply_to_message_id = self.last_alert_messages.get(symbol)
-                
-                # Отправляем сообщение
-                sent_message = await self.bot_app.bot.send_message(
-                    chat_id=self.admin_chat_id,
-                    text=alert_message,
-                    parse_mode='HTML',
-                    disable_web_page_preview=True,
-                    reply_to_message_id=reply_to_message_id
-                )
-                
-                # Сохраняем ID отправленного сообщения
-                self.last_alert_messages[symbol] = sent_message.message_id
-                
-                print(f"[SEND] ✅ Алерт отправлен: {symbol}")
-                return  # Успешно отправили
-                
-            except TimedOut:
-                print(f"[WARN] ⏱ Timeout при отправке алерта {symbol} (попытка {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    print(f"[ERROR] ❌ Не удалось отправить алерт {symbol} после {max_retries} попыток")
+        for chat_id in self.admin_chat_ids:
+            for attempt in range(max_retries):
+                try:
+                    # Получаем ID предыдущего сообщения для этой монеты и пользователя
+                    key = f"{chat_id}_{symbol}"
+                    reply_to_message_id = self.last_alert_messages.get(key)
                     
-            except NetworkError as e:
-                print(f"[WARN] 🌐 Network error при отправке {symbol} (попытка {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    print(f"[ERROR] ❌ Network error, не удалось отправить алерт {symbol}")
+                    # Отправляем сообщение
+                    sent_message = await self.bot_app.bot.send_message(
+                        chat_id=chat_id,
+                        text=alert_message,
+                        parse_mode='HTML',
+                        disable_web_page_preview=True,
+                        reply_to_message_id=reply_to_message_id
+                    )
                     
-            except Exception as e:
-                print(f"[ERROR] ❌ Ошибка отправки алерта {symbol}: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                else:
-                    break
+                    # Сохраняем ID отправленного сообщения
+                    self.last_alert_messages[key] = sent_message.message_id
+                    
+                    print(f"[SEND] ✅ Алерт отправлен для {symbol} пользователю {chat_id}")
+                    break  # Успешно отправили, переходим к следующему пользователю
+                    
+                except TimedOut:
+                    print(f"[WARN] ⏱ Timeout при отправке алерта {symbol} пользователю {chat_id} (попытка {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        print(f"[ERROR] ❌ Не удалось отправить алерт {symbol} пользователю {chat_id} после {max_retries} попыток")
+                        
+                except NetworkError as e:
+                    print(f"[WARN] 🌐 Network error при отправке {symbol} пользователю {chat_id} (попытка {attempt + 1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2
+                    else:
+                        print(f"[ERROR] ❌ Network error, не удалось отправить алерт {symbol} пользователю {chat_id}")
+                        
+                except Exception as e:
+                    print(f"[ERROR] ❌ Ошибка отправки алерта {symbol} пользователю {chat_id}: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        break
     
     async def update_oi_data(self, session: aiohttp.ClientSession, symbols: List[str]):
         """Обновление данных OI для всех символов"""
@@ -500,8 +513,8 @@ class BybitOITracker:
         chat_id = update.effective_chat.id
         
         # Проверка что это админ
-        if chat_id != self.admin_chat_id:
-            await update.message.reply_text("❌ Доступ запрещен. Бот работает только для владельца.")
+        if chat_id not in self.admin_chat_ids:
+            await update.message.reply_text("❌ Доступ запрещен. Бот работает только для авторизованных пользователей.")
             return
         
         self.settings["enabled"] = True
@@ -532,7 +545,7 @@ class BybitOITracker:
     async def settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /settings"""
         chat_id = update.effective_chat.id
-        if chat_id != self.admin_chat_id:
+        if chat_id not in self.admin_chat_ids:
             return
         
         keyboard = [
@@ -553,7 +566,7 @@ class BybitOITracker:
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /status"""
         chat_id = update.effective_chat.id
-        if chat_id != self.admin_chat_id:
+        if chat_id not in self.admin_chat_ids:
             return
         
         status = "✅ Включен" if self.settings["enabled"] else "❌ Выключен"
@@ -585,7 +598,7 @@ class BybitOITracker:
     async def stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /stop"""
         chat_id = update.effective_chat.id
-        if chat_id != self.admin_chat_id:
+        if chat_id not in self.admin_chat_ids:
             return
         
         self.settings["enabled"] = False
@@ -599,7 +612,7 @@ class BybitOITracker:
     async def test_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /test"""
         chat_id = update.effective_chat.id
-        if chat_id != self.admin_chat_id:
+        if chat_id not in self.admin_chat_ids:
             return
         
         test_change_data = {
@@ -648,7 +661,7 @@ class BybitOITracker:
         query = update.callback_query
         chat_id = query.from_user.id
         
-        if chat_id != self.admin_chat_id:
+        if chat_id not in self.admin_chat_ids:
             await query.answer("❌ Доступ запрещен")
             return
         
@@ -680,7 +693,7 @@ class BybitOITracker:
         """Обработчик текстовых сообщений"""
         chat_id = update.effective_chat.id
         
-        if chat_id != self.admin_chat_id:
+        if chat_id not in self.admin_chat_ids:
             return
         
         text = update.message.text.strip()
@@ -757,7 +770,7 @@ class BybitOITracker:
     async def run(self):
         """Запуск бота"""
         print("🤖 Запуск Telegram бота...")
-        print(f"👤 Бот настроен только для пользователя: {self.admin_chat_id}")
+        print(f"👥 Бот настроен для {len(self.admin_chat_ids)} пользователя(ей): {', '.join(map(str, self.admin_chat_ids))}")
         
         # Создание приложения
         self.bot_app = Application.builder().token(self.telegram_token).build()
@@ -778,14 +791,15 @@ class BybitOITracker:
         
         print("✅ Telegram бот запущен!")
         
-        # Уведомляем пользователя о перезапуске
-        try:
-            await self.bot_app.bot.send_message(
-                chat_id=self.admin_chat_id,
-                text="🔄 Бот перезапущен и снова работает!\n\nВаши настройки сохранены ✅"
-            )
-        except Exception as e:
-            print(f"[WARN] Не удалось отправить уведомление о запуске: {e}")
+        # Уведомляем пользователей о перезапуске
+        for chat_id in self.admin_chat_ids:
+            try:
+                await self.bot_app.bot.send_message(
+                    chat_id=chat_id,
+                    text="🔄 Бот перезапущен и снова работает!\n\nВаши настройки сохранены ✅"
+                )
+            except Exception as e:
+                print(f"[WARN] Не удалось отправить уведомление о запуске пользователю {chat_id}: {e}")
         
         print()
         
@@ -800,10 +814,12 @@ async def main():
     TELEGRAM_TOKEN = "8187121513:AAHnKKps-TTzvXcK08MeUFJcCil2C4_IB8I"
     
     # ВАЖНО: Укажи свой chat_id (узнать можно через @userinfobot)
-    ADMIN_CHAT_ID = 725600839,  # ЗАМЕНИ НА СВОЙ CHAT_ID!
+    # Можно передать список chat_ids или один ID
+    ADMIN_CHAT_IDS = [123456789, 987654321]  # ЗАМЕНИ НА СВОИ CHAT_ID'Ы!
+    # Или один ID: ADMIN_CHAT_IDS = 123456789
     
     # Создание и запуск трекера
-    tracker = BybitOITracker(BYBIT_API_KEY, BYBIT_API_SECRET, TELEGRAM_TOKEN, ADMIN_CHAT_ID)
+    tracker = BybitOITracker(BYBIT_API_KEY, BYBIT_API_SECRET, TELEGRAM_TOKEN, ADMIN_CHAT_IDS)
     await tracker.run()
 
 

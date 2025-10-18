@@ -1,7 +1,7 @@
 {
   "settings": {
     "oi_threshold_percent": 3.0,
-    "time_window_minutes": 10,
+    "time_window_minutes": 15,
     "monitored_symbols": [],
     "enabled": true
   }
